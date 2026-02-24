@@ -1,0 +1,1392 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PMO | Openk</title>
+
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+
+<!-- Firebase -->
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getFirestore, collection, getDocs, doc, updateDoc, addDoc, onSnapshot, serverTimestamp, query, orderBy } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+  // ============================================================
+  //  🔥 FIREBASE CONFIG — já configurado com suas credenciais
+  // ============================================================
+  const firebaseConfig = {
+    apiKey: "AIzaSyAJEkXpELPXaYppdxC-TX3vjyOWkXIzdE8",
+    authDomain: "pmo-openk.firebaseapp.com",
+    projectId: "pmo-openk",
+    storageBucket: "pmo-openk.firebasestorage.app",
+    messagingSenderId: "249056137150",
+    appId: "1:249056137150:web:06e8fd8175fc8c020ef3ef"
+  };
+
+  const app = initializeApp(firebaseConfig);
+  const db = getFirestore(app);
+
+  // ============================================================
+  //  ESTADO GLOBAL
+  // ============================================================
+  let allProjects = [];
+  let allComments = {};
+  let charts = {};
+  let currentFilter = null;
+  let currentStatusFilter = null;
+  let currentSearch = '';
+
+  // ============================================================
+  //  LISTENER TEMPO REAL — projetos
+  // ============================================================
+  function initRealtimeListeners() {
+    // Escuta projetos em tempo real
+    const projRef = collection(db, 'projetos');
+    onSnapshot(projRef, (snap) => {
+      allProjects = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      renderAll();
+      updateSyncTime();
+    });
+
+    // Escuta comentários em tempo real
+    const commRef = query(collection(db, 'comentarios'), orderBy('data', 'desc'));
+    onSnapshot(commRef, (snap) => {
+      allComments = {};
+      snap.docs.forEach(d => {
+        const c = { id: d.id, ...d.data() };
+        if (!allComments[c.projetoId]) allComments[c.projetoId] = [];
+        allComments[c.projetoId].push(c);
+      });
+    });
+  }
+
+  // ============================================================
+  //  CLICKUP SYNC — chama o proxy/backend que você vai configurar
+  //  Por enquanto, faz fetch direto (funciona com CORS proxy)
+  // ============================================================
+  const CLICKUP_TOKEN = 'pk_89331553_173Q2DV9A7Y2G1UGIWIBWPUX6FOM2TGI';
+  const CORS_PROXY = 'https://corsproxy.io/?';
+
+  async function syncFromClickUp() {
+    const btn = document.getElementById('btnSync');
+    if (btn) { btn.classList.add('syncing'); btn.innerHTML = '<i class="fa fa-rotate fa-spin"></i> Sincronizando...'; }
+
+    try {
+      // 1. Busca todos os workspaces/teams
+      const teamsRes = await fetch(`${CORS_PROXY}https://api.clickup.com/api/v2/team`, {
+        headers: { Authorization: CLICKUP_TOKEN }
+      });
+      const teamsData = await teamsRes.json();
+      if (!teamsData.teams || !teamsData.teams.length) throw new Error('Nenhum workspace encontrado');
+
+      const teamId = teamsData.teams[0].id;
+
+      // 2. Busca todos os spaces
+      const spacesRes = await fetch(`${CORS_PROXY}https://api.clickup.com/api/v2/team/${teamId}/space`, {
+        headers: { Authorization: CLICKUP_TOKEN }
+      });
+      const spacesData = await spacesRes.json();
+
+      let allLists = [];
+
+      // 3. Para cada space, busca folders e listas
+      for (const space of (spacesData.spaces || [])) {
+        // Listas diretas do space
+        const listsRes = await fetch(`${CORS_PROXY}https://api.clickup.com/api/v2/space/${space.id}/list`, {
+          headers: { Authorization: CLICKUP_TOKEN }
+        });
+        const listsData = await listsRes.json();
+        (listsData.lists || []).forEach(l => allLists.push({ ...l, spaceName: space.name }));
+
+        // Folders do space
+        const foldersRes = await fetch(`${CORS_PROXY}https://api.clickup.com/api/v2/space/${space.id}/folder`, {
+          headers: { Authorization: CLICKUP_TOKEN }
+        });
+        const foldersData = await foldersRes.json();
+        for (const folder of (foldersData.folders || [])) {
+          const flRes = await fetch(`${CORS_PROXY}https://api.clickup.com/api/v2/folder/${folder.id}/list`, {
+            headers: { Authorization: CLICKUP_TOKEN }
+          });
+          const flData = await flRes.json();
+          (flData.lists || []).forEach(l => allLists.push({ ...l, spaceName: space.name, folderName: folder.name }));
+        }
+      }
+
+      // 4. Para cada lista, busca tarefas e salva no Firebase
+      let saved = 0;
+      for (const list of allLists) {
+        try {
+          const tasksRes = await fetch(`${CORS_PROXY}https://api.clickup.com/api/v2/list/${list.id}/task?include_closed=true&subtasks=true`, {
+            headers: { Authorization: CLICKUP_TOKEN }
+          });
+          const tasksData = await tasksRes.json();
+          const tasks = tasksData.tasks || [];
+
+          if (tasks.length === 0) continue;
+
+          // Calcula métricas
+          const responsaveis = [...new Set(tasks.flatMap(t => (t.assignees || []).map(a => a.username || a.email)).filter(Boolean))];
+          const statusCount = {};
+          tasks.forEach(t => {
+            const s = t.status?.status || 'sem status';
+            statusCount[s] = (statusCount[s] || 0) + 1;
+          });
+
+          const totalHours = tasks.reduce((acc, t) => acc + (parseInt(t.time_estimate || 0) / 3600000), 0);
+          const trackedHours = tasks.reduce((acc, t) => acc + (parseInt(t.time_spent || 0) / 3600000), 0);
+
+          // Determina status principal
+          const statusKeys = Object.keys(statusCount);
+          let mainStatus = 'Em Andamento';
+          const statusLower = statusKeys.map(s => s.toLowerCase());
+          if (statusLower.some(s => s.includes('conclu') || s.includes('done') || s.includes('complete'))) {
+            mainStatus = 'Concluído';
+          } else if (statusLower.some(s => s.includes('paralisa') || s.includes('bloqueado') || s.includes('blocked'))) {
+            mainStatus = 'Paralisado';
+          } else if (statusLower.some(s => s.includes('validaç') || s.includes('validacao') || s.includes('review'))) {
+            mainStatus = 'Em Validação';
+          } else if (statusLower.some(s => s.includes('aguard') || s.includes('liberaç'))) {
+            mainStatus = 'Aguardando Liberação';
+          }
+
+          // Verifica atraso
+          const hoje = new Date();
+          const dueDates = tasks.filter(t => t.due_date).map(t => new Date(parseInt(t.due_date)));
+          const latestDue = dueDates.length ? new Date(Math.max(...dueDates)) : null;
+          const atrasado = latestDue && latestDue < hoje && mainStatus !== 'Concluído';
+
+          const projectDoc = {
+            nome: list.name,
+            espaco: list.spaceName || '',
+            pasta: list.folderName || '',
+            status: mainStatus,
+            statusClickup: statusCount,
+            responsaveis,
+            totalTarefas: tasks.length,
+            statusDistribuicao: statusCount,
+            horasPrevistas: Math.round(totalHours * 10) / 10,
+            horasRealizadas: Math.round(trackedHours * 10) / 10,
+            dataPrevista: latestDue ? latestDue.toLocaleDateString('pt-BR') : '',
+            atrasado,
+            clickupListId: list.id,
+            ultimaSync: new Date().toISOString(),
+          };
+
+          // Upsert no Firebase (usa listId como chave)
+          const projRef = collection(db, 'projetos');
+          const snap = await getDocs(projRef);
+          const existing = snap.docs.find(d => d.data().clickupListId === list.id);
+
+          if (existing) {
+            // Preserva campos manuais
+            const curr = existing.data();
+            await updateDoc(doc(db, 'projetos', existing.id), {
+              ...projectDoc,
+              statusManual: curr.statusManual || null,
+            });
+          } else {
+            await addDoc(projRef, projectDoc);
+          }
+          saved++;
+        } catch(e) {
+          console.warn(`Erro na lista ${list.name}:`, e);
+        }
+      }
+
+      showToast(`✅ Sincronização concluída! ${saved} projetos atualizados.`, 'success');
+    } catch(err) {
+      console.error(err);
+      showToast(`❌ Erro na sincronização: ${err.message}`, 'error');
+    } finally {
+      if (btn) { btn.classList.remove('syncing'); btn.innerHTML = '<i class="fa fa-rotate"></i> Sincronizar ClickUp'; }
+    }
+  }
+
+  // ============================================================
+  //  ATUALIZAR STATUS MANUAL
+  // ============================================================
+  async function updateProjectStatus(projectId, newStatus) {
+    await updateDoc(doc(db, 'projetos', projectId), { statusManual: newStatus });
+    showToast('Status atualizado!', 'success');
+  }
+
+  // ============================================================
+  //  ADICIONAR COMENTÁRIO
+  // ============================================================
+  async function addComment(projectId, texto, autor) {
+    await addDoc(collection(db, 'comentarios'), {
+      projetoId: projectId,
+      texto,
+      autor,
+      data: serverTimestamp()
+    });
+    showToast('Comentário salvo!', 'success');
+  }
+
+  // ============================================================
+  //  RENDER PRINCIPAL
+  // ============================================================
+  function renderAll() {
+    const filtered = getFiltered();
+    renderKPIs(filtered);
+    renderCards(filtered);
+    renderCharts(filtered);
+  }
+
+  function getFiltered() {
+    let data = [...allProjects];
+    if (currentFilter) data = data.filter(p => p.espaco === currentFilter);
+    if (currentStatusFilter) data = data.filter(p => getDisplayStatus(p) === currentStatusFilter);
+    if (currentSearch) {
+      const s = currentSearch.toLowerCase();
+      data = data.filter(p => (p.nome || '').toLowerCase().includes(s) || (p.responsaveis || []).some(r => r.toLowerCase().includes(s)));
+    }
+    return data;
+  }
+
+  function getDisplayStatus(p) {
+    return p.statusManual || p.status || 'Em Andamento';
+  }
+
+  function renderKPIs(data) {
+    const total = data.length;
+    const emAndamento = data.filter(p => getDisplayStatus(p) === 'Em Andamento').length;
+    const atrasados = data.filter(p => p.atrasado).length;
+    const totalHoras = data.reduce((acc, p) => acc + (p.horasPrevistas || 0), 0);
+    const horasRealizadas = data.reduce((acc, p) => acc + (p.horasRealizadas || 0), 0);
+    const concluidos = data.filter(p => getDisplayStatus(p) === 'Concluído').length;
+
+    document.getElementById('kpi-total').textContent = total;
+    document.getElementById('kpi-andamento').textContent = emAndamento;
+    document.getElementById('kpi-atrasados').textContent = atrasados;
+    document.getElementById('kpi-horas').textContent = Math.round(totalHoras) + 'h';
+    document.getElementById('kpi-concluidos').textContent = concluidos;
+  }
+
+  function renderCards(data) {
+    const grid = document.getElementById('projectsGrid');
+    if (!grid) return;
+
+    if (data.length === 0) {
+      grid.innerHTML = `<div class="empty-state"><i class="fa fa-folder-open"></i><p>Nenhum projeto encontrado</p><small>Sincronize com o ClickUp ou ajuste os filtros</small></div>`;
+      return;
+    }
+
+    grid.innerHTML = data.map(p => {
+      const status = getDisplayStatus(p);
+      const progress = calcProgress(p);
+      const comments = (allComments[p.id] || []).length;
+      const isAtrasado = p.atrasado;
+      const responsaveis = (p.responsaveis || []).slice(0, 3).map(r =>
+        `<span class="avatar-chip">${r.charAt(0).toUpperCase()}</span>`
+      ).join('');
+
+      const statusOptions = ['Em Andamento', 'Paralisado', 'Em Validação', 'Aguardando Liberação', 'Concluído', 'Planejado'];
+
+      return `
+        <div class="project-card ${isAtrasado ? 'card-atrasado' : ''}" data-id="${p.id}">
+          <div class="card-top">
+            <div class="card-meta">
+              <span class="card-space">${p.espaco || ''}</span>
+              ${p.pasta ? `<span class="card-pasta">/ ${p.pasta}</span>` : ''}
+            </div>
+            ${isAtrasado ? '<span class="badge-atrasado"><i class="fa fa-triangle-exclamation"></i> Atrasado</span>' : ''}
+          </div>
+
+          <h3 class="card-title" title="${p.nome}">${p.nome}</h3>
+
+          <div class="card-status-row">
+            <select class="status-select status-${slugify(status)}" onchange="window._updateStatus('${p.id}', this.value)">
+              ${statusOptions.map(s => `<option value="${s}" ${s === status ? 'selected' : ''}>${s}</option>`).join('')}
+            </select>
+          </div>
+
+          <div class="card-progress">
+            <div class="progress-bar">
+              <div class="progress-fill" style="width: ${progress}%"></div>
+            </div>
+            <span class="progress-label">${progress}%</span>
+          </div>
+
+          <div class="card-metrics">
+            <div class="metric">
+              <i class="fa fa-list-check"></i>
+              <span>${p.totalTarefas || 0} tarefas</span>
+            </div>
+            <div class="metric">
+              <i class="fa fa-clock"></i>
+              <span>${p.horasPrevistas || 0}h prev.</span>
+            </div>
+            ${p.dataPrevista ? `<div class="metric"><i class="fa fa-calendar"></i><span>${p.dataPrevista}</span></div>` : ''}
+          </div>
+
+          <div class="card-footer">
+            <div class="avatars">${responsaveis}</div>
+            <button class="btn-comment" onclick="window._openModal('${p.id}')">
+              <i class="fa fa-comment"></i>
+              ${comments > 0 ? `<span class="comment-count">${comments}</span>` : ''}
+            </button>
+          </div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  function calcProgress(p) {
+    if (!p.statusDistribuicao) return 0;
+    const statusMap = p.statusDistribuicao;
+    let done = 0, total = 0;
+    Object.entries(statusMap).forEach(([s, count]) => {
+      total += count;
+      const sl = s.toLowerCase();
+      if (sl.includes('conclu') || sl.includes('done') || sl.includes('complete') || sl.includes('fechado') || sl.includes('closed')) {
+        done += count;
+      } else if (sl.includes('validaç') || sl.includes('review')) {
+        done += count * 0.85;
+      } else if (sl.includes('aguard') || sl.includes('liberaç')) {
+        done += count * 0.6;
+      } else if (sl.includes('em exec') || sl.includes('progress') || sl.includes('andamento')) {
+        done += count * 0.4;
+      }
+    });
+    return total > 0 ? Math.min(Math.round((done / total) * 100), 100) : 0;
+  }
+
+  function renderCharts(data) {
+    renderStatusChart(data);
+    renderSpaceChart(data);
+    renderHorasChart(data);
+  }
+
+  function renderStatusChart(data) {
+    const ctx = document.getElementById('chartStatus');
+    if (!ctx) return;
+    if (charts.status) { charts.status.destroy(); }
+
+    const statusCount = {};
+    data.forEach(p => {
+      const s = getDisplayStatus(p);
+      statusCount[s] = (statusCount[s] || 0) + 1;
+    });
+
+    const colors = {
+      'Em Andamento': '#10b981',
+      'Concluído': '#3b82f6',
+      'Paralisado': '#ef4444',
+      'Em Validação': '#8b5cf6',
+      'Aguardando Liberação': '#f59e0b',
+      'Planejado': '#94a3b8',
+    };
+
+    charts.status = new Chart(ctx, {
+      type: 'doughnut',
+      data: {
+        labels: Object.keys(statusCount),
+        datasets: [{
+          data: Object.values(statusCount),
+          backgroundColor: Object.keys(statusCount).map(s => colors[s] || '#94a3b8'),
+          borderWidth: 0,
+          hoverOffset: 8
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false, cutout: '68%',
+        plugins: {
+          legend: { position: 'bottom', labels: { padding: 12, usePointStyle: true, font: { size: 11, family: 'DM Sans', weight: '500' } } }
+        }
+      }
+    });
+  }
+
+  function renderSpaceChart(data) {
+    const ctx = document.getElementById('chartEspacos');
+    if (!ctx) return;
+    if (charts.espacos) { charts.espacos.destroy(); }
+
+    const count = {};
+    data.forEach(p => { count[p.espaco || 'Sem espaço'] = (count[p.espaco || 'Sem espaço'] || 0) + 1; });
+
+    const labels = Object.keys(count);
+    const palette = ['#0ea5e9','#10b981','#8b5cf6','#f59e0b','#ef4444','#f97316','#06b6d4','#ec4899'];
+
+    charts.espacos = new Chart(ctx, {
+      type: 'bar',
+      data: {
+        labels,
+        datasets: [{
+          data: Object.values(count),
+          backgroundColor: labels.map((_, i) => palette[i % palette.length]),
+          borderRadius: 6, barThickness: 18
+        }]
+      },
+      options: {
+        indexAxis: 'y', responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: { x: { beginAtZero: true, ticks: { stepSize: 1, font: { family: 'DM Sans' } } }, y: { ticks: { font: { family: 'DM Sans', size: 11 } } } }
+      }
+    });
+  }
+
+  function renderHorasChart(data) {
+    const ctx = document.getElementById('chartHoras');
+    if (!ctx) return;
+    if (charts.horas) { charts.horas.destroy(); }
+
+    const top = [...data].sort((a, b) => (b.horasPrevistas || 0) - (a.horasPrevistas || 0)).slice(0, 8);
+
+    charts.horas = new Chart(ctx, {
+      type: 'bar',
+      data: {
+        labels: top.map(p => p.nome.length > 20 ? p.nome.substring(0, 20) + '…' : p.nome),
+        datasets: [
+          { label: 'Previstas', data: top.map(p => p.horasPrevistas || 0), backgroundColor: '#0ea5e920', borderColor: '#0ea5e9', borderWidth: 2, borderRadius: 4 },
+          { label: 'Realizadas', data: top.map(p => p.horasRealizadas || 0), backgroundColor: '#10b98120', borderColor: '#10b981', borderWidth: 2, borderRadius: 4 },
+        ]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { position: 'bottom', labels: { font: { family: 'DM Sans', size: 11 }, usePointStyle: true } } },
+        scales: {
+          x: { ticks: { font: { family: 'DM Sans', size: 10 } } },
+          y: { beginAtZero: true, ticks: { callback: v => v + 'h', font: { family: 'DM Sans' } } }
+        }
+      }
+    });
+  }
+
+  // ============================================================
+  //  MODAL DE PROJETO
+  // ============================================================
+  function openModal(projectId) {
+    const p = allProjects.find(x => x.id === projectId);
+    if (!p) return;
+
+    const modal = document.getElementById('modal');
+    const comments = allComments[projectId] || [];
+    const status = getDisplayStatus(p);
+
+    modal.querySelector('.modal-title').textContent = p.nome;
+    modal.querySelector('.modal-espaco').textContent = `${p.espaco || ''}${p.pasta ? ' / ' + p.pasta : ''}`;
+    modal.querySelector('.modal-status-badge').textContent = status;
+    modal.querySelector('.modal-status-badge').className = `modal-status-badge status-${slugify(status)}`;
+
+    // Métricas
+    modal.querySelector('#m-tarefas').textContent = p.totalTarefas || 0;
+    modal.querySelector('#m-hprev').textContent = (p.horasPrevistas || 0) + 'h';
+    modal.querySelector('#m-hreal').textContent = (p.horasRealizadas || 0) + 'h';
+    modal.querySelector('#m-data').textContent = p.dataPrevista || '—';
+    modal.querySelector('#m-resp').textContent = (p.responsaveis || []).join(', ') || '—';
+    modal.querySelector('#m-sync').textContent = p.ultimaSync ? new Date(p.ultimaSync).toLocaleString('pt-BR') : '—';
+
+    // Distribuição de status do ClickUp
+    const distEl = modal.querySelector('#m-status-dist');
+    if (p.statusDistribuicao) {
+      distEl.innerHTML = Object.entries(p.statusDistribuicao).map(([s, c]) =>
+        `<span class="dist-tag">${s} <strong>${c}</strong></span>`
+      ).join('');
+    } else {
+      distEl.innerHTML = '—';
+    }
+
+    // Comentários
+    const commList = modal.querySelector('#commentsList');
+    commList.innerHTML = comments.length === 0
+      ? '<p class="no-comments">Nenhum comentário ainda.</p>'
+      : comments.map(c => `
+          <div class="comment-item">
+            <div class="comment-header">
+              <span class="comment-autor">${c.autor || 'PMO'}</span>
+              <span class="comment-data">${c.data?.toDate ? c.data.toDate().toLocaleString('pt-BR') : ''}</span>
+            </div>
+            <p class="comment-text">${c.texto}</p>
+          </div>
+        `).join('');
+
+    // Botão salvar comentário
+    modal.querySelector('#btnSaveComment').onclick = async () => {
+      const texto = modal.querySelector('#commentText').value.trim();
+      const autor = modal.querySelector('#commentAutor').value.trim() || 'PMO';
+      if (!texto) return;
+      await addComment(projectId, texto, autor);
+      modal.querySelector('#commentText').value = '';
+    };
+
+    // Botão salvar status manual
+    const statusSelect = modal.querySelector('#modalStatusSelect');
+    statusSelect.value = status;
+    modal.querySelector('#btnSaveStatus').onclick = async () => {
+      await updateProjectStatus(projectId, statusSelect.value);
+    };
+
+    modal.classList.add('open');
+  }
+
+  function closeModal() {
+    document.getElementById('modal').classList.remove('open');
+  }
+
+  // ============================================================
+  //  FILTROS
+  // ============================================================
+  function buildSpaceFilters() {
+    const container = document.getElementById('spaceFilters');
+    if (!container) return;
+    const spaces = [...new Set(allProjects.map(p => p.espaco).filter(Boolean))];
+    container.innerHTML = spaces.map(s =>
+      `<button class="filter-chip ${currentFilter === s ? 'active' : ''}" onclick="window._filterSpace('${s}')">${s}</button>`
+    ).join('');
+  }
+
+  function updateSyncTime() {
+    const el = document.getElementById('lastSync');
+    if (el) el.textContent = 'Última atualização: ' + new Date().toLocaleTimeString('pt-BR');
+    buildSpaceFilters();
+  }
+
+  function slugify(s) {
+    return (s || '').toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+  }
+
+  function showToast(msg, type = 'info') {
+    const t = document.createElement('div');
+    t.className = `toast toast-${type}`;
+    t.innerHTML = msg;
+    document.body.appendChild(t);
+    setTimeout(() => t.classList.add('show'), 50);
+    setTimeout(() => { t.classList.remove('show'); setTimeout(() => t.remove(), 400); }, 3500);
+  }
+
+  // ============================================================
+  //  EXPÕE FUNÇÕES GLOBAIS
+  // ============================================================
+  window._openModal = openModal;
+  window._closeModal = closeModal;
+  window._syncClickUp = syncFromClickUp;
+  window._updateStatus = updateProjectStatus;
+  window._filterSpace = (space) => {
+    currentFilter = currentFilter === space ? null : space;
+    buildSpaceFilters();
+    renderAll();
+  };
+  window._filterStatus = (status) => {
+    currentStatusFilter = currentStatusFilter === status ? null : status;
+    document.querySelectorAll('.kpi-card').forEach(k => k.classList.remove('active'));
+    if (status) {
+      document.querySelector(`[data-status="${status}"]`)?.classList.add('active');
+    }
+    renderAll();
+  };
+  window._search = (val) => {
+    currentSearch = val;
+    renderAll();
+  };
+
+  // ============================================================
+  //  INIT
+  // ============================================================
+  document.addEventListener('DOMContentLoaded', () => {
+    initRealtimeListeners();
+  });
+</script>
+
+<style>
+:root {
+  --bg: #f0f4f8;
+  --panel: #ffffff;
+  --border: #e2e8f0;
+  --text: #1e293b;
+  --muted: #64748b;
+  --blue: #0ea5e9;
+  --green: #10b981;
+  --red: #ef4444;
+  --yellow: #f59e0b;
+  --purple: #8b5cf6;
+  --shadow: 0 1px 3px rgba(0,0,0,.06), 0 4px 16px rgba(0,0,0,.04);
+  --shadow-md: 0 4px 24px rgba(0,0,0,.08);
+  --radius: 14px;
+  --radius-sm: 8px;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: var(--bg);
+  font-family: 'DM Sans', sans-serif;
+  color: var(--text);
+  min-height: 100vh;
+}
+
+/* ── SIDEBAR ─────────────────────────────── */
+.layout { display: flex; min-height: 100vh; }
+
+.sidebar {
+  width: 220px;
+  background: #0f172a;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  flex-shrink: 0;
+}
+
+.sidebar-brand {
+  padding: 24px 20px 16px;
+  border-bottom: 1px solid #1e293b;
+}
+
+.brand-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 1.5px;
+  color: #475569;
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}
+
+.brand-name {
+  font-size: 18px;
+  font-weight: 700;
+  color: white;
+}
+
+.brand-name span { color: var(--blue); }
+
+.sidebar-sync {
+  padding: 16px;
+  border-bottom: 1px solid #1e293b;
+}
+
+.btn-sync {
+  width: 100%;
+  background: var(--blue);
+  color: white;
+  border: none;
+  padding: 10px 14px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  font-weight: 600;
+  font-family: 'DM Sans', sans-serif;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  transition: all 0.2s;
+}
+
+.btn-sync:hover { background: #0284c7; }
+.btn-sync.syncing { opacity: 0.7; pointer-events: none; }
+
+.sidebar-section {
+  padding: 16px;
+  flex: 1;
+  overflow-y: auto;
+}
+
+.sidebar-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  color: #475569;
+  text-transform: uppercase;
+  margin-bottom: 10px;
+  padding: 0 4px;
+}
+
+.filter-chip {
+  width: 100%;
+  background: transparent;
+  border: none;
+  color: #94a3b8;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  font-family: 'DM Sans', sans-serif;
+  font-weight: 500;
+  cursor: pointer;
+  text-align: left;
+  display: block;
+  margin-bottom: 2px;
+  transition: all 0.15s;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.filter-chip:hover { background: #1e293b; color: white; }
+.filter-chip.active { background: #1e3a8a; color: #93c5fd; }
+
+.sidebar-status { padding: 0 16px 16px; border-top: 1px solid #1e293b; padding-top: 16px; }
+
+.sidebar-footer {
+  padding: 12px 16px;
+  border-top: 1px solid #1e293b;
+  font-size: 10px;
+  color: #475569;
+  font-family: 'DM Mono', monospace;
+}
+
+/* ── MAIN ─────────────────────────────── */
+.main {
+  flex: 1;
+  padding: 28px;
+  min-width: 0;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 28px;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.topbar h1 {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.topbar h1 span { color: var(--muted); font-weight: 400; }
+
+.search-box {
+  display: flex;
+  align-items: center;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0 14px;
+  gap: 8px;
+  box-shadow: var(--shadow);
+}
+
+.search-box i { color: var(--muted); font-size: 13px; }
+
+.search-box input {
+  border: none;
+  outline: none;
+  font-family: 'DM Sans', sans-serif;
+  font-size: 13px;
+  padding: 10px 0;
+  background: transparent;
+  color: var(--text);
+  width: 220px;
+}
+
+/* ── KPIs ─────────────────────────────── */
+.kpis {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 14px;
+  margin-bottom: 28px;
+}
+
+.kpi-card {
+  background: var(--panel);
+  border-radius: var(--radius);
+  padding: 20px;
+  box-shadow: var(--shadow);
+  border: 1.5px solid transparent;
+  cursor: pointer;
+  transition: all 0.2s;
+  position: relative;
+  overflow: hidden;
+}
+
+.kpi-card::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 3px;
+  background: var(--kpi-color, var(--blue));
+}
+
+.kpi-card:hover, .kpi-card.active {
+  border-color: var(--kpi-color, var(--blue));
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-md);
+}
+
+.kpi-icon { font-size: 16px; color: var(--kpi-color, var(--blue)); margin-bottom: 10px; }
+.kpi-label { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
+.kpi-value { font-size: 30px; font-weight: 700; color: var(--text); line-height: 1; }
+
+/* ── CHARTS ─────────────────────────────── */
+.charts-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 18px;
+  margin-bottom: 28px;
+}
+
+.chart-panel {
+  background: var(--panel);
+  border-radius: var(--radius);
+  padding: 20px;
+  box-shadow: var(--shadow);
+  height: 300px;
+  display: flex;
+  flex-direction: column;
+}
+
+.chart-panel h3 {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 16px;
+}
+
+.chart-panel canvas { flex: 1; min-height: 0; }
+
+/* ── PROJECTS GRID ─────────────────────────────── */
+.section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+.section-title { font-size: 14px; font-weight: 700; color: var(--text); }
+.section-count { font-size: 12px; color: var(--muted); }
+
+.projects-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 16px;
+}
+
+.project-card {
+  background: var(--panel);
+  border-radius: var(--radius);
+  padding: 18px;
+  box-shadow: var(--shadow);
+  border: 1.5px solid transparent;
+  transition: all 0.2s;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.project-card:hover {
+  border-color: var(--blue);
+  box-shadow: var(--shadow-md);
+  transform: translateY(-2px);
+}
+
+.card-atrasado { border-color: #fca5a5 !important; background: #fff5f5; }
+.card-atrasado:hover { border-color: var(--red) !important; }
+
+.card-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.card-meta { font-size: 11px; color: var(--muted); font-weight: 500; }
+.card-pasta { opacity: 0.7; }
+
+.badge-atrasado {
+  background: #fee2e2;
+  color: #b91c1c;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 3px 8px;
+  border-radius: 20px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.card-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  line-height: 1.4;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* ── STATUS SELECT ─────────────────────────────── */
+.status-select {
+  width: 100%;
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  border: 1.5px solid var(--border);
+  font-size: 12px;
+  font-weight: 600;
+  font-family: 'DM Sans', sans-serif;
+  cursor: pointer;
+  outline: none;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2394a3b8' stroke-width='2'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  padding-right: 30px;
+}
+
+.status-em-andamento { background: #dcfce7; color: #166534; border-color: #bbf7d0; }
+.status-conclu-do, .status-concluido { background: #dbeafe; color: #1e40af; border-color: #bfdbfe; }
+.status-paralisado { background: #fee2e2; color: #991b1b; border-color: #fecaca; }
+.status-em-valida-o, .status-em-validação { background: #f3e8ff; color: #7e22ce; border-color: #e9d5ff; }
+.status-aguardando-libera-o, .status-aguardando-liberação { background: #fff7ed; color: #c2410c; border-color: #fed7aa; }
+.status-planejado { background: #f1f5f9; color: #475569; border-color: #e2e8f0; }
+
+/* ── PROGRESS ─────────────────────────────── */
+.card-progress { display: flex; align-items: center; gap: 10px; }
+.progress-bar { flex: 1; height: 6px; background: #f1f5f9; border-radius: 3px; overflow: hidden; }
+.progress-fill { height: 100%; background: linear-gradient(90deg, var(--blue), var(--green)); border-radius: 3px; transition: width 0.6s ease; }
+.progress-label { font-size: 11px; font-weight: 700; color: var(--muted); font-family: 'DM Mono', monospace; width: 32px; text-align: right; }
+
+/* ── CARD METRICS ─────────────────────────────── */
+.card-metrics { display: flex; gap: 12px; flex-wrap: wrap; }
+.metric { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--muted); }
+.metric i { font-size: 10px; }
+
+/* ── CARD FOOTER ─────────────────────────────── */
+.card-footer { display: flex; align-items: center; justify-content: space-between; margin-top: auto; }
+.avatars { display: flex; gap: -4px; }
+.avatar-chip {
+  width: 26px; height: 26px;
+  background: var(--blue);
+  color: white;
+  border-radius: 50%;
+  font-size: 10px;
+  font-weight: 700;
+  display: flex; align-items: center; justify-content: center;
+  border: 2px solid white;
+  margin-right: -6px;
+}
+
+.btn-comment {
+  background: #f1f5f9;
+  border: none;
+  color: var(--muted);
+  width: 32px; height: 32px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 13px;
+  display: flex; align-items: center; justify-content: center;
+  position: relative;
+  transition: all 0.2s;
+  gap: 4px;
+}
+
+.btn-comment:hover { background: var(--blue); color: white; }
+
+.comment-count {
+  background: var(--blue);
+  color: white;
+  font-size: 9px;
+  font-weight: 700;
+  width: 16px; height: 16px;
+  border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  position: absolute;
+  top: -4px; right: -4px;
+}
+
+/* ── EMPTY STATE ─────────────────────────────── */
+.empty-state {
+  grid-column: 1/-1;
+  text-align: center;
+  padding: 80px 20px;
+  color: var(--muted);
+}
+.empty-state i { font-size: 40px; margin-bottom: 12px; display: block; opacity: 0.3; }
+.empty-state p { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
+.empty-state small { font-size: 12px; }
+
+/* ── MODAL ─────────────────────────────── */
+.modal-overlay {
+  position: fixed; inset: 0;
+  background: rgba(15, 23, 42, 0.6);
+  backdrop-filter: blur(4px);
+  z-index: 1000;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+.modal-overlay.open { display: flex; }
+
+.modal-box {
+  background: var(--panel);
+  border-radius: 20px;
+  width: 100%;
+  max-width: 640px;
+  max-height: 88vh;
+  overflow-y: auto;
+  box-shadow: 0 24px 64px rgba(0,0,0,0.2);
+}
+
+.modal-header {
+  padding: 24px 24px 16px;
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  background: white;
+  z-index: 1;
+  border-radius: 20px 20px 0 0;
+}
+
+.modal-header-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.modal-title { font-size: 16px; font-weight: 700; color: var(--text); line-height: 1.3; }
+.modal-espaco { font-size: 11px; color: var(--muted); margin-bottom: 10px; }
+
+.modal-status-badge {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 5px 12px;
+  border-radius: 20px;
+  display: inline-block;
+}
+
+.btn-close-modal {
+  background: #f1f5f9; border: none; width: 32px; height: 32px;
+  border-radius: 8px; cursor: pointer; color: var(--muted);
+  font-size: 16px; display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0; transition: all 0.2s;
+}
+.btn-close-modal:hover { background: var(--red); color: white; }
+
+.modal-body { padding: 20px 24px; }
+
+.modal-section { margin-bottom: 20px; }
+.modal-section-title { font-size: 11px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 10px; }
+
+.modal-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+
+.modal-metric {
+  background: #f8fafc;
+  border-radius: var(--radius-sm);
+  padding: 12px;
+}
+
+.modal-metric-label { font-size: 10px; color: var(--muted); font-weight: 600; text-transform: uppercase; margin-bottom: 4px; }
+.modal-metric-value { font-size: 16px; font-weight: 700; color: var(--text); }
+
+.dist-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: #f1f5f9;
+  border-radius: 20px;
+  padding: 4px 10px;
+  font-size: 11px;
+  color: var(--muted);
+  margin: 3px;
+}
+
+.dist-tag strong { color: var(--text); }
+
+/* Status update */
+.status-update-row { display: flex; gap: 8px; align-items: center; }
+.status-update-row select {
+  flex: 1;
+  padding: 8px 12px;
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-family: 'DM Sans', sans-serif;
+  font-size: 13px;
+  outline: none;
+}
+
+.btn-save {
+  background: var(--blue);
+  color: white;
+  border: none;
+  padding: 9px 16px;
+  border-radius: var(--radius-sm);
+  font-family: 'DM Sans', sans-serif;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.2s;
+}
+
+.btn-save:hover { background: #0284c7; }
+
+/* Comentários */
+#commentsList { margin-bottom: 14px; max-height: 200px; overflow-y: auto; }
+
+.comment-item {
+  background: #f8fafc;
+  border-radius: var(--radius-sm);
+  padding: 12px;
+  margin-bottom: 8px;
+}
+
+.comment-header { display: flex; justify-content: space-between; margin-bottom: 6px; }
+.comment-autor { font-size: 11px; font-weight: 700; color: var(--text); }
+.comment-data { font-size: 10px; color: var(--muted); font-family: 'DM Mono', monospace; }
+.comment-text { font-size: 12px; color: var(--text); line-height: 1.5; }
+.no-comments { font-size: 12px; color: var(--muted); text-align: center; padding: 16px; }
+
+.comment-form { display: flex; flex-direction: column; gap: 8px; }
+.comment-form-row { display: flex; gap: 8px; }
+
+.comment-form input, .comment-form textarea {
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  font-family: 'DM Sans', sans-serif;
+  font-size: 13px;
+  outline: none;
+  transition: border-color 0.2s;
+  resize: none;
+}
+
+.comment-form input:focus, .comment-form textarea:focus { border-color: var(--blue); }
+.comment-form textarea { min-height: 80px; flex: 1; }
+.comment-form input { width: 160px; }
+
+/* ── TOASTS ─────────────────────────────── */
+.toast {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  background: #1e293b;
+  color: white;
+  padding: 12px 20px;
+  border-radius: 10px;
+  font-size: 13px;
+  font-weight: 500;
+  font-family: 'DM Sans', sans-serif;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.2);
+  z-index: 9999;
+  transform: translateY(80px);
+  opacity: 0;
+  transition: all 0.3s ease;
+}
+
+.toast.show { transform: translateY(0); opacity: 1; }
+.toast-success { background: #064e3b; border-left: 4px solid var(--green); }
+.toast-error { background: #7f1d1d; border-left: 4px solid var(--red); }
+
+/* ── RESPONSIVE ─────────────────────────────── */
+@media (max-width: 1200px) {
+  .charts-grid { grid-template-columns: 1fr 1fr; }
+  .kpis { grid-template-columns: repeat(3, 1fr); }
+}
+
+@media (max-width: 900px) {
+  .sidebar { display: none; }
+  .charts-grid { grid-template-columns: 1fr; }
+  .kpis { grid-template-columns: repeat(2, 1fr); }
+  .modal-metrics { grid-template-columns: repeat(2, 1fr); }
+}
+</style>
+</head>
+<body>
+
+<div class="layout">
+  <!-- SIDEBAR -->
+  <aside class="sidebar">
+    <div class="sidebar-brand">
+      <div class="brand-label">Escritório de Projetos</div>
+      <div class="brand-name">PM<span>O</span></div>
+    </div>
+
+    <div class="sidebar-sync">
+      <button class="btn-sync" id="btnSync" onclick="window._syncClickUp()">
+        <i class="fa fa-rotate"></i> Sincronizar ClickUp
+      </button>
+    </div>
+
+    <div class="sidebar-section">
+      <div class="sidebar-label">Espaços</div>
+      <div id="spaceFilters">
+        <div style="font-size:11px;color:#475569;padding:8px 4px;">
+          Clique em "Sincronizar" para carregar os espaços
+        </div>
+      </div>
+    </div>
+
+    <div class="sidebar-footer" id="lastSync">—</div>
+  </aside>
+
+  <!-- MAIN -->
+  <main class="main">
+    <div class="topbar">
+      <h1>Projetos <span>/ Visão Geral</span></h1>
+      <div class="search-box">
+        <i class="fa fa-magnifying-glass"></i>
+        <input type="text" placeholder="Buscar projeto ou responsável..." oninput="window._search(this.value)">
+      </div>
+    </div>
+
+    <!-- KPIs -->
+    <div class="kpis">
+      <div class="kpi-card" style="--kpi-color: #0ea5e9" data-status="" onclick="window._filterStatus(null)">
+        <div class="kpi-icon"><i class="fa fa-folder"></i></div>
+        <div class="kpi-label">Total de Projetos</div>
+        <div class="kpi-value" id="kpi-total">—</div>
+      </div>
+      <div class="kpi-card" style="--kpi-color: #10b981" data-status="Em Andamento" onclick="window._filterStatus('Em Andamento')">
+        <div class="kpi-icon"><i class="fa fa-circle-play"></i></div>
+        <div class="kpi-label">Em Andamento</div>
+        <div class="kpi-value" id="kpi-andamento">—</div>
+      </div>
+      <div class="kpi-card" style="--kpi-color: #ef4444" data-status="" onclick="window._filterStatus(null)">
+        <div class="kpi-icon"><i class="fa fa-triangle-exclamation"></i></div>
+        <div class="kpi-label">Atrasados</div>
+        <div class="kpi-value" id="kpi-atrasados">—</div>
+      </div>
+      <div class="kpi-card" style="--kpi-color: #f59e0b" data-status="">
+        <div class="kpi-icon"><i class="fa fa-clock"></i></div>
+        <div class="kpi-label">Horas Previstas</div>
+        <div class="kpi-value" id="kpi-horas">—</div>
+      </div>
+      <div class="kpi-card" style="--kpi-color: #3b82f6" data-status="Concluído" onclick="window._filterStatus('Concluído')">
+        <div class="kpi-icon"><i class="fa fa-circle-check"></i></div>
+        <div class="kpi-label">Concluídos</div>
+        <div class="kpi-value" id="kpi-concluidos">—</div>
+      </div>
+    </div>
+
+    <!-- CHARTS -->
+    <div class="charts-grid">
+      <div class="chart-panel">
+        <h3>Distribuição por Status</h3>
+        <canvas id="chartStatus"></canvas>
+      </div>
+      <div class="chart-panel">
+        <h3>Projetos por Espaço</h3>
+        <canvas id="chartEspacos"></canvas>
+      </div>
+      <div class="chart-panel">
+        <h3>Horas — Top 8 Projetos</h3>
+        <canvas id="chartHoras"></canvas>
+      </div>
+    </div>
+
+    <!-- PROJECTS -->
+    <div class="section-header">
+      <span class="section-title">Todos os Projetos</span>
+      <span class="section-count" id="projectCount"></span>
+    </div>
+
+    <div class="projects-grid" id="projectsGrid">
+      <div class="empty-state">
+        <i class="fa fa-rotate"></i>
+        <p>Pronto para sincronizar!</p>
+        <small>Clique em "Sincronizar ClickUp" na barra lateral para carregar seus projetos.</small>
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- MODAL -->
+<div class="modal-overlay" id="modal" onclick="if(event.target===this) window._closeModal()">
+  <div class="modal-box">
+    <div class="modal-header">
+      <div class="modal-header-top">
+        <div>
+          <div class="modal-espaco modal-espaco"></div>
+          <div class="modal-title modal-title">—</div>
+        </div>
+        <button class="btn-close-modal" onclick="window._closeModal()"><i class="fa fa-xmark"></i></button>
+      </div>
+      <span class="modal-status-badge">—</span>
+    </div>
+
+    <div class="modal-body">
+      <!-- Métricas -->
+      <div class="modal-section">
+        <div class="modal-section-title">Métricas do Projeto</div>
+        <div class="modal-metrics">
+          <div class="modal-metric">
+            <div class="modal-metric-label">Tarefas</div>
+            <div class="modal-metric-value" id="m-tarefas">—</div>
+          </div>
+          <div class="modal-metric">
+            <div class="modal-metric-label">Horas Previstas</div>
+            <div class="modal-metric-value" id="m-hprev">—</div>
+          </div>
+          <div class="modal-metric">
+            <div class="modal-metric-label">Horas Realizadas</div>
+            <div class="modal-metric-value" id="m-hreal">—</div>
+          </div>
+          <div class="modal-metric">
+            <div class="modal-metric-label">Prazo</div>
+            <div class="modal-metric-value" id="m-data">—</div>
+          </div>
+          <div class="modal-metric" style="grid-column:span 2">
+            <div class="modal-metric-label">Responsáveis</div>
+            <div class="modal-metric-value" style="font-size:13px" id="m-resp">—</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Status ClickUp -->
+      <div class="modal-section">
+        <div class="modal-section-title">Distribuição de Status (ClickUp)</div>
+        <div id="m-status-dist">—</div>
+      </div>
+
+      <!-- Alterar status -->
+      <div class="modal-section">
+        <div class="modal-section-title">Alterar Status do Projeto</div>
+        <div class="status-update-row">
+          <select id="modalStatusSelect">
+            <option>Em Andamento</option>
+            <option>Paralisado</option>
+            <option>Em Validação</option>
+            <option>Aguardando Liberação</option>
+            <option>Concluído</option>
+            <option>Planejado</option>
+          </select>
+          <button class="btn-save" id="btnSaveStatus">Salvar</button>
+        </div>
+        <div style="font-size:10px;color:var(--muted);margin-top:6px">
+          <i class="fa fa-circle-info"></i> O status do ClickUp é detectado automaticamente. Use este campo para sobrescrever manualmente.
+        </div>
+      </div>
+
+      <!-- Comentários -->
+      <div class="modal-section">
+        <div class="modal-section-title">Comentários do PMO</div>
+        <div id="commentsList"></div>
+        <div class="comment-form">
+          <div class="comment-form-row">
+            <input type="text" id="commentAutor" placeholder="Seu nome" value="PMO">
+            <textarea id="commentText" placeholder="Adicione uma observação, risco ou decisão importante..."></textarea>
+          </div>
+          <button class="btn-save" id="btnSaveComment" style="align-self:flex-end">
+            <i class="fa fa-paper-plane"></i> Salvar Comentário
+          </button>
+        </div>
+      </div>
+
+      <div style="font-size:10px;color:var(--muted);text-align:right;font-family:'DM Mono',monospace">
+        Última sync: <span id="m-sync">—</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>
